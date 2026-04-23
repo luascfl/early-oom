@@ -1,0 +1,57 @@
+[2026-03-25 20:46:35] Modo dry-run, log em /home/lucas/Downloads/early-oom/memory-guard-setup-dry-run-20260325-204635.log
+[2026-03-25 20:46:35] Iniciando setup unificado de earlyoom + zram
+[2026-03-25 20:46:35] [dry-run] apt-get update
+[2026-03-25 20:46:35] [dry-run] apt-get install -y --no-install-recommends earlyoom zram-tools
+[2026-03-25 20:46:47] Detectado pacote zram-config, removendo para evitar conflito com zram-tools
+[2026-03-25 20:46:47] [dry-run] systemctl disable --now zram-config.service
+[2026-03-25 20:46:47] [dry-run] apt-get purge -y zram-config
+[2026-03-25 20:46:47] [dry-run] systemctl disable --now zram-monitor.timer zram-monitor.service
+[2026-03-25 20:46:49] [dry-run] swapoff /dev/zram0
+[2026-03-25 20:46:49] [dry-run] bash -c echo 1 > '/sys/block/zram0/reset'
+[2026-03-25 20:46:49] Dispositivos zram resetados antes de subir configuração nova
+[2026-03-25 20:46:50] [dry-run] install -d -m 0755 /var/backups/memory-guard
+[2026-03-25 20:46:51] [dry-run] cp -a /etc/default/zramswap /var/backups/memory-guard/zramswap.20260325-204635.bak
+[2026-03-25 20:46:51] [dry-run] install -D -m 0644 /tmp/tmp.XyPjM4tDUt /etc/default/zramswap
+[2026-03-25 20:46:51] Atualizado: /etc/default/zramswap
+[2026-03-25 20:46:56] [dry-run] install -D -m 0755 /tmp/tmp.L9Jipb73UZ /usr/local/bin/earlyoom-kill-log.sh
+[2026-03-25 20:46:56] Atualizado: /usr/local/bin/earlyoom-kill-log.sh
+[2026-03-25 20:46:57] [dry-run] install -d -m 0755 /var/backups/memory-guard
+[2026-03-25 20:46:57] [dry-run] cp -a /etc/default/earlyoom /var/backups/memory-guard/earlyoom.20260325-204635.bak
+[2026-03-25 20:46:57] [dry-run] install -D -m 0644 /tmp/tmp.Y0B8VqjryM /etc/default/earlyoom
+[2026-03-25 20:46:57] Atualizado: /etc/default/earlyoom
+[2026-03-25 20:46:57] [dry-run] install -D -m 0644 /tmp/tmp.7RZFygenwg /etc/sysctl.d/99-memory-guard.conf
+[2026-03-25 20:46:57] Atualizado: /etc/sysctl.d/99-memory-guard.conf
+[2026-03-25 20:46:57] [dry-run] install -D -m 0755 /tmp/tmp.L5A0GpCKPp /usr/local/bin/memory-pressure-log.sh
+[2026-03-25 20:46:57] Atualizado: /usr/local/bin/memory-pressure-log.sh
+[2026-03-25 20:46:59] [dry-run] install -D -m 0644 /tmp/tmp.IQgGuKWPB0 /etc/systemd/system/memory-pressure-log.service
+[2026-03-25 20:46:59] Atualizado: /etc/systemd/system/memory-pressure-log.service
+[2026-03-25 20:46:59] [dry-run] install -D -m 0644 /tmp/tmp.0XMZbrJjx3 /etc/systemd/system/memory-pressure-log.timer
+[2026-03-25 20:46:59] Atualizado: /etc/systemd/system/memory-pressure-log.timer
+[2026-03-25 20:46:59] [dry-run] install -D -m 0644 /tmp/tmp.qMKfPhty45 /etc/logrotate.d/memory-guard
+[2026-03-25 20:46:59] Atualizado: /etc/logrotate.d/memory-guard
+[2026-03-25 20:46:59] [dry-run] sysctl --system
+[2026-03-25 20:46:59] [dry-run] systemctl daemon-reload
+[2026-03-25 20:46:59] [dry-run] systemctl enable --now zramswap.service
+[2026-03-25 20:46:59] [dry-run] systemctl restart zramswap.service
+[2026-03-25 20:46:59] [dry-run] systemctl enable --now earlyoom.service
+[2026-03-25 20:46:59] [dry-run] systemctl restart earlyoom.service
+[2026-03-25 20:46:59] [dry-run] systemctl enable --now memory-pressure-log.timer
+[2026-03-25 20:46:59] [dry-run] systemctl start memory-pressure-log.service
+[2026-03-25 20:46:59] Resumo pós-aplicação
+[2026-03-25 20:46:59] [dry-run] swapon --show --output=NAME,TYPE,SIZE,USED,PRIO
+[2026-03-25 20:46:59] [dry-run] zramctl
+[2026-03-25 20:46:59] [dry-run] systemctl --no-pager --full status earlyoom.service
+[2026-03-25 20:46:59] [dry-run] systemctl --no-pager --full status zramswap.service
+[2026-03-25 20:46:59] [dry-run] systemctl --no-pager --full status memory-pressure-log.timer
+
+Setup concluído.
+Logs principais:
+- /home/lucas/Downloads/early-oom/memory-guard-setup-dry-run-20260325-204635.log
+- /var/log/memory-guard/earlyoom-kills.log
+- /var/log/memory-guard/memory-pressure.log
+- /var/log/memory-guard/memory-pressure-incidents.log
+
+Verificação rápida:
+  sudo journalctl -u earlyoom -n 50 --no-pager
+  sudo systemctl status zramswap --no-pager
+  sudo tail -n 50 /var/log/memory-guard/memory-pressure.log

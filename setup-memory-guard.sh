@@ -2,9 +2,27 @@
 set -Eeuo pipefail
 
 DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=true
-fi
+LOGGING_ONLY=false
+
+usage() {
+  cat <<'EOF'
+Usage: setup-memory-guard.sh [--dry-run] [--logging-only]
+
+  --dry-run       Show host changes without writing them.
+  --logging-only  Install freeze evidence logging without changing ZRAM,
+                  EarlyOOM, sysctl, or installed packages.
+EOF
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --dry-run) DRY_RUN=true ;;
+    --logging-only) LOGGING_ONLY=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 64 ;;
+  esac
+  shift
+done
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 SETUP_LOG=""
@@ -77,7 +95,6 @@ disable_conflicting_zram_stack() {
     run apt-get purge -y zram-config
   fi
 
-  run systemctl disable --now zram-monitor.timer zram-monitor.service || true
 }
 
 reset_existing_zram_devices() {
@@ -142,12 +159,10 @@ write_earlyoom_config() {
   local tmp
   tmp="$(mktemp)"
   cat > "$tmp" <<'EOF'
-# Perfil de preservação: mantém apps de estudo/trabalho, só atua em pressão realmente crítica.
-# -m 8: só considera memória crítica abaixo de 8% disponível
-# -s 55: só considera swap crítica abaixo de 55% livre
-# --prefer: prioriza encerrar apps pesados não essenciais
-# --avoid: protege Librewolf, Obsidian, terminal, tmux, rclone e processos do OMP
-EARLYOOM_ARGS="-p -r 60 -m 8 -s 55 --ignore-root-user --prefer '^(chrome|chromium|code|electron)$' --avoid '^(obsidian|librewolf|Web Content|Isolated Web Co|WebExtensions|Privileged Cont|RDD Process|Socket Process|forkserver|Utility Process|tmux|qterminal|bun|python3|rclone|systemd|systemd-logind|dbus-daemon|dbus-broker|Xorg|Xwayland|lightdm|sddm|gdm|lxqt-session|openbox)$' -N /usr/local/bin/earlyoom-kill-log.sh"
+# Perfil anti-freeze: preserva o desktop e encerra conteúdo web pesado antes do lockup.
+# -m 20 e -s 15 só atuam com pouca RAM e pouca swap livre.
+# --prefer prioriza conteúdo web pesado; --avoid protege o desktop e serviços críticos.
+EARLYOOM_ARGS="-p -r 60 -m 20 -s 15 --ignore-root-user --prefer '(chrome|chromium|code|electron|Isolated Web Co|Web Content)' --avoid '(obsidian|librewolf|WebExtensions|Privileged Cont|RDD Process|Socket Process|forkserver|Utility Process|tmux|qterminal|bun|python3|rclone|systemd|systemd-logind|dbus-daemon|dbus-broker|Xorg|Xwayland|lightdm|sddm|gdm|lxqt-session|openbox)' -N /usr/local/bin/earlyoom-kill-log.sh"
 EOF
   write_file_if_changed "/etc/default/earlyoom" "0644" "$tmp"
   rm -f "$tmp"
@@ -157,10 +172,9 @@ write_sysctl_tuning() {
   local tmp
   tmp="$(mktemp)"
   cat > "$tmp" <<'EOF'
-# memory-guard: ajustes conservadores para desktop com baixa RAM + HDD.
-# swappiness moderado, ainda favorece zram sem empurrar cedo demais para swap em HDD.
-vm.swappiness=110
-vm.page-cluster=0
+# Os valores abaixo são os vencedores do benchmark deste notebook com ZRAM.
+vm.swappiness=89
+vm.page-cluster=2
 # evita picos longos de escrita suja em HDD sob pressão.
 vm.dirty_background_ratio=3
 vm.dirty_ratio=10
@@ -174,7 +188,7 @@ EOF
 }
 
 write_monitoring_units() {
-  local script_tmp service_tmp timer_tmp logrotate_tmp
+  local script_tmp service_tmp timer_tmp session_script_tmp session_service_tmp journald_tmp logrotate_tmp
 
   script_tmp="$(mktemp)"
   cat > "$script_tmp" <<'EOF'
@@ -191,6 +205,8 @@ mem_available_kib="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
 swap_total_kib="$(awk '/SwapTotal:/ {print $2}' /proc/meminfo)"
 swap_free_kib="$(awk '/SwapFree:/ {print $2}' /proc/meminfo)"
 swap_used_kib="$((swap_total_kib - swap_free_kib))"
+pressure_some_avg10="$(awk '$1 == "some" {sub("avg10=", "", $2); print $2}' /proc/pressure/memory)"
+pressure_full_avg10="$(awk '$1 == "full" {sub("avg10=", "", $2); print $2}' /proc/pressure/memory)"
 
 mem_available_mib="$((mem_available_kib / 1024))"
 swap_used_mib="$((swap_used_kib / 1024))"
@@ -202,10 +218,20 @@ fi
 if (( swap_used_mib > 2048 )); then
   alerts+=("swap_used=${swap_used_mib}MiB")
 fi
+if awk -v value="$pressure_some_avg10" 'BEGIN { exit !(value >= 10) }'; then
+  alerts+=("pressure_some_avg10=${pressure_some_avg10}")
+fi
+if awk -v value="$pressure_full_avg10" 'BEGIN { exit !(value >= 5) }'; then
+  alerts+=("pressure_full_avg10=${pressure_full_avg10}")
+fi
 
 {
   printf -- '--- %s\n' "$(date --iso-8601=seconds)"
-  printf '[free -m]\n'
+  printf '[load average]\n'
+  cat /proc/loadavg
+  printf '\n[memory pressure]\n'
+  cat /proc/pressure/memory
+  printf '\n[free -m]\n'
   free -m
   printf '\n[swapon --show]\n'
   swapon --show
@@ -217,6 +243,10 @@ fi
   else
     printf 'none\n'
   fi
+  if (( ${#alerts[@]} > 0 )); then
+    printf '\n[largest resident processes]\n'
+    ps -eo pid,ppid,comm,rss,%mem,args --sort=-rss | sed -n '1,13p'
+  fi
   printf '\n'
 } >> "$LOG_FILE"
 
@@ -226,6 +256,62 @@ fi
 EOF
   write_file_if_changed "/usr/local/bin/memory-pressure-log.sh" "0755" "$script_tmp"
   rm -f "$script_tmp"
+
+  session_script_tmp="$(mktemp)"
+  cat > "$session_script_tmp" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LOG_DIR="/var/log/memory-guard"
+STATE_DIR="/var/lib/memory-guard"
+EVENT_LOG="$LOG_DIR/session-events.log"
+PREVIOUS_BOOT_LOG="$LOG_DIR/previous-boot-evidence.log"
+ACTIVE_SESSION="$STATE_DIR/active-session"
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+
+install -d -m 0755 "$LOG_DIR" "$STATE_DIR"
+
+event() {
+  printf '%s boot_id=%s %s\n' "$(date --iso-8601=seconds)" "$BOOT_ID" "$*" >> "$EVENT_LOG"
+}
+
+capture_previous_boot_evidence() {
+  {
+    printf -- '--- %s unclean_session=%s\n' "$(date --iso-8601=seconds)" "$1"
+    printf '[previous earlyoom events]\n'
+    journalctl -b -1 -u earlyoom --no-pager -n 120 2>&1 || true
+    printf '\n[previous kernel warnings]\n'
+    journalctl -b -1 -k -p warning --no-pager -n 120 2>&1 || true
+    printf '\n'
+  } >> "$PREVIOUS_BOOT_LOG"
+}
+
+case "${1:-}" in
+  start)
+    if [[ -s "$ACTIVE_SESSION" ]]; then
+      previous_session="$(tr '\n' ' ' < "$ACTIVE_SESSION")"
+      event "UNCLEAN_SHUTDOWN previous_session=${previous_session}"
+      capture_previous_boot_evidence "$previous_session"
+    fi
+    printf 'boot_id=%s started_at=%s\n' "$BOOT_ID" "$(date --iso-8601=seconds)" > "$ACTIVE_SESSION"
+    event "SESSION_STARTED"
+    ;;
+  stop)
+    if [[ -s "$ACTIVE_SESSION" ]] && grep -q "boot_id=${BOOT_ID}" "$ACTIVE_SESSION"; then
+      event "SESSION_STOPPED_CLEANLY"
+      rm -f "$ACTIVE_SESSION"
+    else
+      event "SESSION_STOPPED_WITHOUT_ACTIVE_MARKER"
+    fi
+    ;;
+  *)
+    printf 'Usage: %s start|stop\n' "$0" >&2
+    exit 64
+    ;;
+esac
+EOF
+  write_file_if_changed "/usr/local/bin/memory-guard-session-log.sh" "0755" "$session_script_tmp"
+  rm -f "$session_script_tmp"
 
   service_tmp="$(mktemp)"
   cat > "$service_tmp" <<'EOF'
@@ -247,8 +333,8 @@ Description=Timer de snapshots de memória/zram
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
-AccuracySec=30s
+OnUnitActiveSec=1min
+AccuracySec=15s
 Persistent=true
 
 [Install]
@@ -257,11 +343,42 @@ EOF
   write_file_if_changed "/etc/systemd/system/memory-pressure-log.timer" "0644" "$timer_tmp"
   rm -f "$timer_tmp"
 
+  session_service_tmp="$(mktemp)"
+  cat > "$session_service_tmp" <<'EOF'
+[Unit]
+Description=Registro de sessões e desligamentos anormais do memory guard
+After=local-fs.target systemd-journald.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/memory-guard-session-log.sh start
+ExecStop=/usr/local/bin/memory-guard-session-log.sh stop
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_file_if_changed "/etc/systemd/system/memory-guard-session-log.service" "0644" "$session_service_tmp"
+  rm -f "$session_service_tmp"
+
+  journald_tmp="$(mktemp)"
+  cat > "$journald_tmp" <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=128M
+RuntimeMaxUse=64M
+EOF
+  write_file_if_changed "/etc/systemd/journald.conf.d/90-memory-guard.conf" "0644" "$journald_tmp"
+  rm -f "$journald_tmp"
+
   logrotate_tmp="$(mktemp)"
   cat > "$logrotate_tmp" <<'EOF'
 /var/log/memory-guard/*.log {
-    rotate 14
+    rotate 30
     daily
+    maxsize 10M
     missingok
     notifempty
     compress
@@ -273,9 +390,17 @@ EOF
   rm -f "$logrotate_tmp"
 }
 
+apply_monitoring_services() {
+  run systemctl daemon-reload
+  run systemctl kill -s HUP systemd-journald.service
+  run systemctl enable --now memory-pressure-log.timer
+  run systemctl start memory-pressure-log.service
+  run systemctl enable memory-guard-session-log.service
+  run systemctl restart memory-guard-session-log.service
+}
+
 apply_services() {
   run sysctl --system
-  run systemctl daemon-reload
 
   run systemctl enable --now zramswap.service
   run systemctl restart zramswap.service
@@ -283,8 +408,7 @@ apply_services() {
   run systemctl enable --now earlyoom.service
   run systemctl restart earlyoom.service
 
-  run systemctl enable --now memory-pressure-log.timer
-  run systemctl start memory-pressure-log.service
+  apply_monitoring_services
 }
 
 show_postcheck() {
@@ -294,6 +418,7 @@ show_postcheck() {
   run systemctl --no-pager --full status earlyoom.service
   run systemctl --no-pager --full status zramswap.service
   run systemctl --no-pager --full status memory-pressure-log.timer
+  run systemctl --no-pager --full status memory-guard-session-log.service
 
   cat <<EOF
 
@@ -303,17 +428,29 @@ Logs principais:
 - /var/log/memory-guard/earlyoom-kills.log
 - /var/log/memory-guard/memory-pressure.log
 - /var/log/memory-guard/memory-pressure-incidents.log
+- /var/log/memory-guard/session-events.log
+- /var/log/memory-guard/previous-boot-evidence.log
 
 Verificação rápida:
   sudo journalctl -u earlyoom -n 50 --no-pager
-  sudo systemctl status zramswap --no-pager
-  sudo tail -n 50 /var/log/memory-guard/memory-pressure.log
+  sudo journalctl --list-boots --no-pager
+  sudo systemctl status memory-guard-session-log --no-pager
+  sudo tail -n 50 /var/log/memory-guard/session-events.log
 EOF
 }
 
 main() {
   ensure_root
   setup_logging
+
+  if [[ "$LOGGING_ONLY" == true ]]; then
+    log "Instalando somente a evidência de congelamentos"
+    write_earlyoom_hook
+    write_monitoring_units
+    apply_monitoring_services
+    show_postcheck
+    return
+  fi
 
   log "Iniciando setup unificado de earlyoom + zram"
   apt_install_requirements

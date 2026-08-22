@@ -3,14 +3,18 @@ set -Eeuo pipefail
 
 DRY_RUN=false
 LOGGING_ONLY=false
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+ORIGINAL_ARGS=("$@")
+
 
 usage() {
   cat <<'EOF'
-Usage: setup-memory-guard.sh [--dry-run] [--logging-only]
+Usage: memory-guard.sh [--dry-run] [--logging-only]
 
   --dry-run       Show host changes without writing them.
   --logging-only  Install freeze evidence logging without changing ZRAM,
-                  EarlyOOM, sysctl, or installed packages.
+                  EarlyOOM, or installed packages.
 EOF
 }
 
@@ -64,9 +68,27 @@ write_file_if_changed() {
 }
 
 ensure_root() {
-  if [[ "$DRY_RUN" == false && "$EUID" -ne 0 ]]; then
-    exec sudo -E bash "$0"
+  if [[ "$DRY_RUN" == true || "$EUID" -eq 0 ]]; then
+    return
   fi
+
+  if sudo -n "$SCRIPT_DIR/$SCRIPT_NAME" "$@" 2>/dev/null; then
+    exit 0
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    exec sudo "$SCRIPT_DIR/$SCRIPT_NAME" "$@"
+  fi
+
+  local term
+  for term in qterminal lxterminal xterm; do
+    if command -v "$term" >/dev/null 2>&1; then
+      exec "$term" -e bash -c 'sudo "$@"; code=$?; printf "\nPressione Enter para fechar..."; read -r _; exit "$code"' bash "$SCRIPT_DIR/$SCRIPT_NAME" "$@"
+    fi
+  done
+
+  printf 'Erro: precisa de root e nenhum terminal foi encontrado para pedir a senha.\n' >&2
+  exit 1
 }
 
 setup_logging() {
@@ -168,24 +190,6 @@ EOF
   rm -f "$tmp"
 }
 
-write_sysctl_tuning() {
-  local tmp
-  tmp="$(mktemp)"
-  cat > "$tmp" <<'EOF'
-# Os valores abaixo são os vencedores do benchmark deste notebook com ZRAM.
-vm.swappiness=89
-vm.page-cluster=2
-# evita picos longos de escrita suja em HDD sob pressão.
-vm.dirty_background_ratio=3
-vm.dirty_ratio=10
-EOF
-  if [[ -f "/etc/sysctl.d/99-memory-guard.conf" ]]; then
-    backup_file_if_exists "/etc/sysctl.d/99-memory-guard.conf"
-    run rm -f "/etc/sysctl.d/99-memory-guard.conf"
-  fi
-  write_file_if_changed "/etc/sysctl.d/zz-memory-guard.conf" "0644" "$tmp"
-  rm -f "$tmp"
-}
 
 write_monitoring_units() {
   local script_tmp service_tmp timer_tmp session_script_tmp session_service_tmp journald_tmp logrotate_tmp
@@ -354,7 +358,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/memory-guard-session-log.sh start
 ExecStop=/usr/local/bin/memory-guard-session-log.sh stop
-TimeoutStartSec=30s
+TimeoutStartSec=120s
 TimeoutStopSec=15s
 
 [Install]
@@ -400,7 +404,6 @@ apply_monitoring_services() {
 }
 
 apply_services() {
-  run sysctl --system
 
   run systemctl enable --now zramswap.service
   run systemctl restart zramswap.service
@@ -440,7 +443,7 @@ EOF
 }
 
 main() {
-  ensure_root
+  ensure_root "${ORIGINAL_ARGS[@]}"
   setup_logging
 
   if [[ "$LOGGING_ONLY" == true ]]; then
@@ -452,7 +455,7 @@ main() {
     return
   fi
 
-  log "Iniciando setup unificado de earlyoom + zram"
+  log "Iniciando Memory Guard: ZRAM + EarlyOOM + evidência de congelamentos"
   apt_install_requirements
   disable_conflicting_zram_stack
   reset_existing_zram_devices
@@ -460,7 +463,6 @@ main() {
   write_zramswap_config
   write_earlyoom_hook
   write_earlyoom_config
-  write_sysctl_tuning
   write_monitoring_units
 
   apply_services
